@@ -1,13 +1,6 @@
 -- Writes value to RAM using little endian
-local prevDomain = ""
 function writeRAM(domain, address, size, value)
-	-- update domain
-	if (prevDomain ~= domain) then
-		prevDomain = domain
-		if not memory.usememorydomain(domain) then
-			return
-		end
-	end
+	memory.usememorydomain(domain)
 
 	-- default size short
 	if (size == nil) then
@@ -29,13 +22,7 @@ end
 
 -- Reads a value from RAM using little endian
 function readRAM(domain, address, size)
-	-- update domain
-	if (prevDomain ~= domain) then
-		prevDomain = domain
-		if not memory.usememorydomain(domain) then
-			return
-		end
-	end
+	memory.usememorydomain(domain)
 
 	-- default size short
 	if (size == nil) then
@@ -224,29 +211,18 @@ end
 
 -- Event to check if any game events have changed
 function eventTriggerEvent(prevRam, newRam)
-	local events = {}
-	-- check if any changes
-	if(newRam.events[0] ~= nil or newRam.events[1] ~= nil or newRam.events[2] ~= nil or newRam.events[3] ~= nil or newRam.events[4] ~= nil or newRam.events[5] ~= nil or newRam.events[6] ~= nil or newRam.events[7] ~= nil or newRam.events[8] ~= nil or newRam.events[9] ~= nil or newRam.events[10] ~= nil or newRam.events[11] ~= nil or newRam.events[12] ~= nil and (prevRam.events[0] ~= newRam.events[0] or prevRam.events[1] ~= newRam.events[1] or prevRam.events[2] ~= newRam.events[2] or prevRam.events[3] ~= newRam.events[3] or prevRam.events[4] ~= newRam.events[4] or prevRam.events[5] ~= newRam.events[5] or prevRam.events[6] ~= newRam.events[6] or prevRam.events[7] ~= newRam.events[7] or prevRam.events[8] ~= newRam.events[8] or prevRam.events[9] ~= newRam.events[9] or prevRam.events[10] ~= newRam.events[10] or prevRam.events[11] ~= newRam.events[11] or prevRam.events[12] ~= newRam.events[12] or prevRam.events[13] ~= newRam.events[13])) then
-		prevRam.events = newRam.events
-		events[0] = newRam.events[0]
-		events[1] = newRam.events[1]
-		events[2] = newRam.events[2]
-		events[3] = newRam.events[3]
-		events[4] = newRam.events[4]
-		events[5] = newRam.events[5]
-		events[6] = newRam.events[6]
-		events[7] = newRam.events[7]
-		events[8] = newRam.events[8]
-		events[9] = newRam.events[9]
-		events[10] = newRam.events[10]
-		events[11] = newRam.events[11]
-		events[12] = newRam.events[12]
-		events[13] = newRam.events[13]
-		return events
-	end
+    local changed = false
+    for i = 0, 13 do
+        if newRam.events[i] ~= nil and prevRam.events[i] ~= newRam.events[i] then
+            changed = true
+            break
+        end
+    end
 
-	-- no events changed
-	return false
+    if not changed then return false end
+
+    prevRam.events = newRam.events
+    return newRam.events
 end
 
 -- Event to check if any ammo changed
