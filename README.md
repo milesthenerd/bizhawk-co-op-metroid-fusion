@@ -123,4 +123,4 @@ BizHawk, Lua, Luasocket, and kikito's sha1 script. Lua, luasocket, and sha1.lua 
 
 ### Issues
 
-If you have any problems with the script (and restarting BizHawk does not fix them,) contact me (TestRunner ([@Test_Runner](https://twitter.com/Test_Runner)) on Twitter or on Discord. You can also submit an issue here on the GitHub.
+If you have an error that starts with `NLua` in the Lua console output, try swapping `Lua Core` to `NLua` and then back to `Lua+LuaInterface`.
