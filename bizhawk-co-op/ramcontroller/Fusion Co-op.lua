@@ -544,6 +544,30 @@ function mf_ram.getMessage()
 		changed = true
 	end
 
+	-- Projectile fire sync: broadcast shots we fired this frame.
+	pcall(function()
+		local cur = snapshotProjActive()
+		if mf_ram.proj_injected then
+			for slot in pairs(mf_ram.proj_injected) do
+				if not cur[slot] then mf_ram.proj_injected[slot] = nil end
+			end
+		end
+		local newly = findNewlyActiveSlots(mf_ram.proj_active_prev)
+		mf_ram.proj_active_prev = cur
+		if #newly > 0 then
+			local fires = {}
+			for _, slot in ipairs(newly) do
+				if not (mf_ram.proj_injected and mf_ram.proj_injected[slot]) then
+					fires[#fires + 1] = base64Encode(projEntryToString(readProjEntry(slot)))
+				end
+			end
+			if #fires > 0 then
+				message["fire"] = { e = fires }
+				changed = true
+			end
+		end
+	end)
+
 	-- Update the frame pointer
 	prevRAM = newRAM
 
@@ -579,9 +603,7 @@ function mf_ram.processMessage(their_user, message)
 		prevRAM.ammo = setAmmo(prevRAM.ammo, message["m"])
 	end
 
-	-- Per-player overlay state, keyed by username so any number of remote
-	-- players can be tracked and drawn (not just one). The framework relays
-	-- every client's messages to all others, so we receive everyone's data.
+	-- Per-player overlay state
 	if message["pos"] or message["spr"] then
 		local pl = mf_ram.players[their_user]
 		if not pl then
@@ -611,11 +633,34 @@ function mf_ram.processMessage(their_user, message)
 			end
 		end
 	end
+
+	-- Projectile fire sync (inbound): mirror a remote player's shots so they hit
+	-- our enemies. Skip our OWN fire events (their_user == config.user) to avoid
+	-- duplicating shots we already have; only inject if the sender is in our room.
+	if message["fire"] and their_user ~= config.user then
+		pcall(function()
+			local fire = message["fire"]
+			local my_area = readRAM("System Bus", 0x300002C, 1)
+			local my_room = readRAM("System Bus", 0x300002D, 1)
+			local p = mf_ram.players[their_user]
+			local same_room = p and p.pos
+			                  and p.pos.area == my_area and p.pos.room == my_room
+			if same_room and fire.e then
+				local entries = fire.e
+				if type(entries) ~= "table" then entries = { entries } end
+				for _, enc in pairs(entries) do
+					injectProjEntry(projEntryFromString(base64Decode(enc)))
+				end
+			end
+		end)
+	end
 end
 
 mf_ram.itemcount = 100
 mf_ram.my_last_pos  = nil   -- tracks last sent pos to throttle pos messages
 mf_ram.players      = {}    -- players[username] = {pos, sprite, argb, last_frame}
+mf_ram.proj_active_prev = nil   -- previous-frame projectile active flags (fire sync)
+mf_ram.proj_injected    = {}    -- slots holding injected remote shots (don't re-send)
 
 OAM_SIZES = {
     [0] = {{8,8},{16,16},{32,32},{64,64}},
@@ -630,6 +675,80 @@ SAMUS_PALETTES = { [0]=true, [1]=true, [2]=true, [3]=true, [4]=true, [5]=true }
 -- Max tile index for Samus sprites. Her tiles are always low-numbered;
 -- high tile indices (256+) belong to environment objects and HUD elements.
 SAMUS_TILE_MAX = 256
+
+-- We capture a shot's whole 32-byte entry the frame it spawns and inject it
+-- into a free slot on the receiver.
+PROJ_BASE     = 0x3000960
+PROJ_STRIDE   = 0x20
+PROJ_SLOTS    = 16
+PROJ_F_STATUS = 0x00
+
+function readProjEntry(slot)
+    memory.usememorydomain("System Bus")
+    local base  = PROJ_BASE + slot * PROJ_STRIDE
+    local bytes = memory.readbyterange(base, PROJ_STRIDE)  -- 0-indexed
+    local out = {}
+    for i = 0, PROJ_STRIDE - 1 do out[i + 1] = bytes[i] end
+    return out
+end
+
+function snapshotProjActive()
+    memory.usememorydomain("System Bus")
+    local t = {}
+    for slot = 0, PROJ_SLOTS - 1 do
+        t[slot] = memory.readbyte(PROJ_BASE + slot * PROJ_STRIDE + PROJ_F_STATUS) ~= 0
+    end
+    return t
+end
+
+function findNewlyActiveSlots(prev)
+    memory.usememorydomain("System Bus")
+    local newly = {}
+    for slot = 0, PROJ_SLOTS - 1 do
+        local st  = memory.readbyte(PROJ_BASE + slot * PROJ_STRIDE + PROJ_F_STATUS)
+        local was = prev and prev[slot]
+        if st ~= 0 and not was then
+            newly[#newly + 1] = slot
+        end
+    end
+    return newly
+end
+
+function findFreeProjSlot()
+    memory.usememorydomain("System Bus")
+    for slot = 0, PROJ_SLOTS - 1 do
+        if memory.readbyte(PROJ_BASE + slot * PROJ_STRIDE + PROJ_F_STATUS) == 0 then
+            return slot
+        end
+    end
+    return nil
+end
+
+-- Inject a 32-byte entry into a free slot. Records the slot in proj_injected so
+-- the sender side won't re-broadcast it (which would echo-loop and multiply).
+function injectProjEntry(entry)
+    local slot = findFreeProjSlot()
+    if not slot then return false end
+    memory.usememorydomain("System Bus")
+    local base = PROJ_BASE + slot * PROJ_STRIDE
+    for i = 0, PROJ_STRIDE - 1 do
+        memory.writebyte(base + i, entry[i + 1] or 0)
+    end
+    if mf_ram.proj_injected then mf_ram.proj_injected[slot] = true end
+    return true
+end
+
+function projEntryToString(entry)
+    local chars = {}
+    for i = 1, PROJ_STRIDE do chars[i] = string.char((entry[i] or 0) % 256) end
+    return table.concat(chars)
+end
+
+function projEntryFromString(str)
+    local out = {}
+    for i = 1, PROJ_STRIDE do out[i] = string.byte(str, i) or 0 end
+    return out
+end
 
 function collectSamusEntries(samus_sx, samus_sy)
     memory.usememorydomain("OAM")
@@ -666,8 +785,6 @@ function collectSamusEntries(samus_sx, samus_sy)
         local cx   = oam_x + w / 2
         local cy   = oam_y + h / 2
 
-        -- Proximity: Samus body fits in ~±20px X, ±36px Y from her feet origin.
-        -- Shift center check 18px up from her feet to target her torso.
         local near_x  = math.abs(cx - samus_sx) < 24
         local near_y  = math.abs(cy - (samus_sy - 18)) < 40
         -- Palette: reject entries using palettes not associated with Samus.
@@ -705,13 +822,7 @@ SPRITE_H = 80
 SPRITE_OX = 32   -- origin X within the bitmap (Samus centre column)
 SPRITE_OY = 64   -- origin Y within the bitmap (Samus feet row)
 
--- Rasterize the given OAM entries into a flat indexed bitmap.
--- Returns: pixels (array of palette-packed values), and a palette colour table.
--- Each pixel value encodes (pal * 16 + colIdx); 0 = transparent.
--- origin_sx/sy: Samus's screen position (entries are positioned relative to it).
 function rasterizeSamus(entries, origin_sx, origin_sy)
-    -- IMPORTANT: call getObjTileStride() FIRST (it switches to System Bus),
-    -- then set VRAM domain so tile reads below hit VRAM, not System Bus.
     local stride = getObjTileStride()
     memory.usememorydomain("VRAM")
     local buf = {}                 -- buf[1..W*H], 0 = transparent
@@ -912,19 +1023,48 @@ if mf_ram.frame_handler_id then
     mf_ram.frame_handler_id = nil
 end
 
+-- Pick the background layer that actually acts as the camera this frame and
+-- return Samus's screen position under it. We read all four BG scroll registers
+-- from the BGPositions table (0x30000C8: BG0 X/Y, +4 BG1, +8 BG2, +C BG3) and
+-- choose the layer whose scroll places Samus on-screen. Normally BG0 is the
+-- camera, but some rooms (e.g. water-effect rooms) drive the visual effect on
+-- BG0 and scroll the level on BG1, so BG0 no longer matches the camera.
+function selectCameraScreenPos(wx, wy)
+    memory.usememorydomain("System Bus")
+    local px, py = wx / 4, wy / 4
+    local best_sx, best_sy, best_score = nil, nil, -1
+    -- BG0..BG3 X scroll at 0x30000C8 + layer*4; Y at +2.
+    for layer = 0, 3 do
+        local cx = memory.read_u16_le(0x30000C8 + layer * 4)
+        local cy = memory.read_u16_le(0x30000CA + layer * 4)
+        local sx = (px - cx) % 512; if sx > 256 then sx = sx - 512 end
+        local sy = (py - cy) % 512; if sy > 256 then sy = sy - 512 end
+        local on = (sx > -32 and sx < 272 and sy > -48 and sy < 200)
+        if on then
+            local dxc = math.abs(sx - 120)
+            local dyc = math.abs(sy - 80)
+            local score = 1000 - (dxc + dyc)
+            if score > best_score then
+                best_score = score; best_sx = sx; best_sy = sy
+            end
+        end
+    end
+    if best_sx then return best_sx, best_sy end
+    
+    local cx = memory.read_u16_le(0x30000C8)
+    local cy = memory.read_u16_le(0x30000CA)
+    local sx = (px - cx) % 512; if sx > 256 then sx = sx - 512 end
+    local sy = (py - cy) % 512; if sy > 256 then sy = sy - 512 end
+    return sx, sy
+end
+
 local function onFrameEnd()
     local wx    = readRAM("System Bus", 0x300125A, 2)
     local wy    = readRAM("System Bus", 0x300125C, 2)
-    -- Use BG0 scroll registers (0x30000C8/CA)
-    local cam_x = readRAM("System Bus", 0x30000C8, 2)
-    local cam_y = readRAM("System Bus", 0x30000CA, 2)
-    -- BG0 scroll wraps within 512px; world coords keep climbing. Normalise the
-    -- difference into a single wrap window so P1's on-screen position is always
-    -- valid even when world and scroll are in different 512px windows.
-    local samus_sx = ((wx / 4) - cam_x) % 512
-    local samus_sy = ((wy / 4) - cam_y) % 512
-    if samus_sx > 256 then samus_sx = samus_sx - 512 end
-    if samus_sy > 256 then samus_sy = samus_sy - 512 end
+    -- Camera: auto-select the BG layer that tracks Samus (BG0 normally; BG1 in
+    -- rooms where an effect screws BG0's scroll). This fixes positioning in
+    -- effect rooms without per-room special-casing.
+    local samus_sx, samus_sy = selectCameraScreenPos(wx, wy)
 
     local my_area = readRAM("System Bus", 0x300002C, 1)
     local my_room = readRAM("System Bus", 0x300002D, 1)
@@ -964,7 +1104,8 @@ local function onFrameEnd()
            and pl.sprite
            and pl.sprite.buf
            and pl.sprite.argb then
-            -- Screen position relative to P1 (avoids BG0 scroll wraparound).
+            -- Screen position relative to P1. samus_sx/sy now come from the
+            -- auto-selected camera layer, so this is correct in all rooms.
             local world_dx = (pl.pos.x / 4) - (wx / 4)
             local world_dy = (pl.pos.y / 4) - (wy / 4)
             local sx = samus_sx + world_dx
