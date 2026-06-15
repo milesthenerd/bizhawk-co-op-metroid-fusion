@@ -39,7 +39,7 @@ $destination.Copyhere($zip_file.items())
 Remove-Item $filename
 
 #download bizhawk-co-op
-$url = "https://github.com/milesthenerd/bizhawk-co-op/archive/master.zip"
+$url = "https://github.com/milesthenerd/bizhawk-co-op-metroid-fusion/archive/master.zip"
 $filename = "bizhawk-co-op.zip"
 Invoke-WebRequest -Uri $url -OutFile $filename
 #unzip
