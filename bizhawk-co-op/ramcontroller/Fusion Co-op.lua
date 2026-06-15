@@ -568,6 +568,72 @@ function mf_ram.getMessage()
 		end
 	end)
 
+	-- Enemy/boss HP sync: detect HP drops on local enemies this frame (our shots
+	-- landing) and broadcast the new HP keyed by Sprite ID, so the boss's health
+	-- pool is shared. We compare against last frame's snapshot; any enemy whose HP
+	-- decreased gets sent. pcall-guarded so an enemy-array hiccup can't kill the
+	-- rest of the message.
+	pcall(function()
+		local cur = snapshotEnemies()
+		local prev = mf_ram.enemy_prev
+		-- Suppress ALL enemy sync across a room/area change: the array is reused
+		-- for different enemies, so diffs are meaningless and would mass-misfire.
+		local area = readRAM("System Bus", 0x300002C, 1)
+		local room = readRAM("System Bus", 0x300002D, 1)
+		local room_changed = (mf_ram.hp_last_room ~= room) or (mf_ram.hp_last_area ~= area)
+		mf_ram.hp_last_area, mf_ram.hp_last_room = area, room
+		if prev and not room_changed then
+			local hits = {}
+			for key, e in pairs(cur) do
+				local pe = prev[key]
+				-- Same entry still holds the same enemy and HP dropped, by a
+				-- plausible single-frame amount (guards against garbage reads).
+				-- Send the TRUE value, including 0: some entities (e.g. a Core-X
+				-- shell) CRACK at 0 HP rather than dying into an X, and need 0 to
+				-- propagate. Enemies that die into an X are additionally handled by
+				-- the full death-entry clone below, which lands the real death.
+				if pe and pe.id == e.id and e.hp < pe.hp then
+					hits[#hits + 1] = { k = e.kind, id = e.id, s = e.slot, hp = e.hp }
+				end
+			end
+			if #hits > 0 then
+				message["hp"] = hits
+				changed = true
+			end
+
+			-- DEATH CLONE: when an entity ENTERS its HP=0 transition this frame
+			-- (HP reached 0 while still present), capture its FULL entry — the
+			-- complete, game-authored state — and send it. The receiver writes it
+			-- over its matching entity, reproducing the exact transition (enemy
+			-- dissolve + X spawn, or a Core-X shell cracking) without us
+			-- reconstructing any fields. Covers BOTH arrays: main enemies (matched
+			-- by Sprite ID) and sub-sprites / boss parts like a Core-X shell
+			-- (matched by slot index). Capped to avoid mass-fire on a cull.
+			local deaths = {}
+			for key, e in pairs(cur) do
+				local pe = prev[key]
+				if pe and pe.id == e.id and pe.hp > 0 and e.hp == 0 then
+					if e.kind == "m" then
+						deaths[#deaths + 1] = {
+							t = "m", id = e.id, s = e.slot,
+							d = base64Encode(enemyEntryToString(readEnemyEntry(e.slot))),
+						}
+					elseif e.kind == "s" then
+						deaths[#deaths + 1] = {
+							t = "s", id = 0, s = e.slot,
+							d = base64Encode(subEntryToString(readSubEntry(e.slot))),
+						}
+					end
+				end
+			end
+			if #deaths > 0 and #deaths <= 3 then
+				message["edie"] = deaths
+				changed = true
+			end
+		end
+		mf_ram.enemy_prev = cur
+	end)
+
 	-- Update the frame pointer
 	prevRAM = newRAM
 
@@ -634,9 +700,7 @@ function mf_ram.processMessage(their_user, message)
 		end
 	end
 
-	-- Projectile fire sync (inbound): mirror a remote player's shots so they hit
-	-- our enemies. Skip our OWN fire events (their_user == config.user) to avoid
-	-- duplicating shots we already have; only inject if the sender is in our room.
+	-- Projectile fire sync (inbound)
 	if message["fire"] and their_user ~= config.user then
 		pcall(function()
 			local fire = message["fire"]
@@ -654,6 +718,76 @@ function mf_ram.processMessage(their_user, message)
 			end
 		end)
 	end
+
+	-- Enemy/boss HP sync (inbound): apply the other player's damage to our copy
+	-- of the matching enemy (matched by Sprite ID), MIN-merging so shared damage
+	-- accumulates. Skip our own echoed events; only when in the same room.
+	if message["hp"] and their_user ~= config.user then
+		pcall(function()
+			local my_area = readRAM("System Bus", 0x300002C, 1)
+			local my_room = readRAM("System Bus", 0x300002D, 1)
+			local p = mf_ram.players[their_user]
+			local same_room = p and p.pos
+			                  and p.pos.area == my_area and p.pos.room == my_room
+			if same_room then
+				local hits = message["hp"]
+				for _, h in pairs(hits) do
+					-- h = { k=kind, id=, s=slot, hp= }. Apply the synced HP value
+					-- (heal-aware reconcile in applyEnemyHP). HP=0 transitions
+					-- (enemy death into X, Core-X shell cracking) are driven by the
+					-- full-entry death clone (the "edie" handler below), which writes
+					-- the complete game-authored state — so here we just keep HP in
+					-- agreement and let the clone run the actual transition.
+					applyEnemyHP(h.k or "m", tonumber(h.id) or 0,
+					             tonumber(h.s) or 0, tonumber(h.hp))
+				end
+			end
+		end)
+
+		-- Death clone (inbound): the other instance sent a full dying-enemy entry.
+		-- Write it over our matching enemy so our game runs the exact same death
+		-- (dissolve + X spawn) from a complete, consistent, game-authored state —
+		-- replacing the field-poking that cascaded. Matched by Sprite ID; same-room
+		-- gated; capped; only applied to an enemy actually present.
+		if message["edie"] and their_user ~= config.user then
+			pcall(function()
+				local my_area = readRAM("System Bus", 0x300002C, 1)
+				local my_room = readRAM("System Bus", 0x300002D, 1)
+				local p = mf_ram.players[their_user]
+				local same_room = p and p.pos
+				                  and p.pos.area == my_area and p.pos.room == my_room
+				if same_room then
+					local deaths = message["edie"]
+					local done = 0
+					for _, d in pairs(deaths) do
+						if done < 3 and d.d then
+							local t = d.t or "m"
+							if t == "s" then
+								-- sub-sprite: matched by slot index
+								local slot = tonumber(d.s)
+								if slot and slot >= 0 and slot < SS_SLOTS then
+									memory.usememorydomain("System Bus")
+									local base = SS_BASE + slot * SS_STRIDE
+									if memory.read_u32_le(base + SS_F_OAM) ~= 0 then
+										writeSubEntry(slot, subEntryFromString(base64Decode(d.d)))
+										done = done + 1
+									end
+								end
+							else
+								-- main array: matched by Sprite ID
+								local id = tonumber(d.id) or 0
+								local slot = findEnemyByID(id, tonumber(d.s))
+								if slot then
+									writeEnemyEntry(slot, enemyEntryFromString(base64Decode(d.d)))
+									done = done + 1
+								end
+							end
+						end
+					end
+				end
+			end)
+		end
+	end
 end
 
 mf_ram.itemcount = 100
@@ -661,6 +795,7 @@ mf_ram.my_last_pos  = nil   -- tracks last sent pos to throttle pos messages
 mf_ram.players      = {}    -- players[username] = {pos, sprite, argb, last_frame}
 mf_ram.proj_active_prev = nil   -- previous-frame projectile active flags (fire sync)
 mf_ram.proj_injected    = {}    -- slots holding injected remote shots (don't re-send)
+mf_ram.enemy_prev       = nil   -- previous-frame enemy HP snapshot (HP sync)
 
 OAM_SIZES = {
     [0] = {{8,8},{16,16},{32,32},{64,64}},
@@ -750,6 +885,202 @@ function projEntryFromString(str)
     return out
 end
 
+-- ============================================================================
+-- Enemy / boss HP + death sync
+-- ============================================================================
+-- The SpriteData array (0x3000140) holds all enemies and bosses. Per-entry:
+--   +0x00 u16 Status (0 = empty slot)   +0x02 u16 Y   +0x04 u16 X
+--   +0x14 u16 Health                    +0x1D u8  Sprite ID (enemy type)
+-- We share damage: each frame we detect HP DROPS on local enemies (our shots
+-- landing) and send the new HP keyed by Sprite ID. The receiver applies MIN(its
+-- HP, received HP) to the matching enemy, so damage from both players stacks and
+-- neither side can heal the boss back. When an enemy reaches 0 on either side it
+-- dies on both. Enemies are matched by Sprite ID (+0x1D): a boss room has one
+-- boss, so this is unambiguous; for regular enemies the (id, slot) pair is used.
+
+SD_BASE     = 0x3000140
+SD_STRIDE   = 0x38
+SD_SLOTS    = 24
+SD_F_STATUS = 0x00
+SD_F_HP     = 0x14
+SD_F_SPRID  = 0x1D
+SD_F_POSE   = 0x24
+SD_F_XPOS   = 0x04
+SD_F_YPOS   = 0x02
+
+-- Sub-sprite array: parts of composite bosses (e.g. Yakuza) keep their HP here,
+-- NOT in the main array. Exactly two fixed slots, 16 bytes each:
+--   +0x00 OAM ptr (4)  +0x08 Y  +0x0A X  +0x0C u16 Health  +0x0E/F Work.
+-- No Status or Sprite-ID field, so a slot is "active" when its OAM pointer is
+-- nonzero, and we match across instances by slot index (0 or 1) — fine because
+-- there are only two and they spawn deterministically for a scripted boss.
+SS_BASE    = 0x3000784
+SS_STRIDE  = 0x10
+SS_SLOTS   = 2
+SS_F_OAM   = 0x00
+SS_F_HP    = 0x0C
+
+HP_DRIFT_MAX = 200
+HP_KILL_GATE = 60
+
+-- Snapshot active enemies: returns a table keyed by slot with {hp, id}.
+-- Snapshot active enemies from BOTH arrays. Keys are strings so the two arrays
+-- don't collide: "m<slot>" for main-array enemies, "s<slot>" for sub-sprites.
+function snapshotEnemies()
+    memory.usememorydomain("System Bus")
+    local t = {}
+    -- Main enemy array.
+    for slot = 0, SD_SLOTS - 1 do
+        local base = SD_BASE + slot * SD_STRIDE
+        local st = memory.read_u16_le(base + SD_F_STATUS)
+        if st ~= 0 then
+            t["m" .. slot] = {
+                kind = "m", slot = slot,
+                hp = memory.read_u16_le(base + SD_F_HP),
+                id = memory.readbyte(base + SD_F_SPRID),
+                pose = memory.readbyte(base + SD_F_POSE),
+            }
+        end
+    end
+    -- Sub-sprite array (composite-boss parts). Active when OAM pointer != 0.
+    for slot = 0, SS_SLOTS - 1 do
+        local base = SS_BASE + slot * SS_STRIDE
+        if memory.read_u32_le(base + SS_F_OAM) ~= 0 then
+            t["s" .. slot] = {
+                kind = "s", slot = slot,
+                hp = memory.read_u16_le(base + SS_F_HP),
+                id = 0,   -- no ID for sub-sprites; matched by slot
+                pose = 0,
+            }
+        end
+    end
+    return t
+end
+
+-- Read a full enemy entry (all SD_STRIDE bytes) as a 1-indexed byte array, for
+-- cloning a dying enemy's complete, game-authored death state to the other
+-- instance.
+function readEnemyEntry(slot)
+    memory.usememorydomain("System Bus")
+    local base = SD_BASE + slot * SD_STRIDE
+    local bytes = memory.readbyterange(base, SD_STRIDE)  -- 0-indexed
+    local out = {}
+    for i = 0, SD_STRIDE - 1 do out[i + 1] = bytes[i] end
+    return out
+end
+
+-- Write a full enemy entry over the matched enemy slot, dropping it into the
+-- exact death state the owner instance produced.
+function writeEnemyEntry(slot, entry)
+    memory.usememorydomain("System Bus")
+    local base = SD_BASE + slot * SD_STRIDE
+    for i = 0, SD_STRIDE - 1 do
+        memory.writebyte(base + i, entry[i + 1] or 0)
+    end
+end
+
+function enemyEntryToString(entry)
+    local chars = {}
+    for i = 1, SD_STRIDE do chars[i] = string.char((entry[i] or 0) % 256) end
+    return table.concat(chars)
+end
+
+function enemyEntryFromString(str)
+    local out = {}
+    for i = 1, SD_STRIDE do out[i] = string.byte(str, i) or 0 end
+    return out
+end
+
+-- Same full-entry clone helpers for the sub-sprite array (stride SS_STRIDE),
+-- so composite-boss parts and the Core-X shell can clone their HP=0 transition
+-- (shell crack) across instances. Matched by slot index (sub-sprites have no ID).
+function readSubEntry(slot)
+    memory.usememorydomain("System Bus")
+    local base = SS_BASE + slot * SS_STRIDE
+    local bytes = memory.readbyterange(base, SS_STRIDE)
+    local out = {}
+    for i = 0, SS_STRIDE - 1 do out[i + 1] = bytes[i] end
+    return out
+end
+
+function writeSubEntry(slot, entry)
+    memory.usememorydomain("System Bus")
+    local base = SS_BASE + slot * SS_STRIDE
+    for i = 0, SS_STRIDE - 1 do
+        memory.writebyte(base + i, entry[i + 1] or 0)
+    end
+end
+
+function subEntryToString(entry)
+    local chars = {}
+    for i = 1, SS_STRIDE do chars[i] = string.char((entry[i] or 0) % 256) end
+    return table.concat(chars)
+end
+
+function subEntryFromString(str)
+    local out = {}
+    for i = 1, SS_STRIDE do out[i] = string.byte(str, i) or 0 end
+    return out
+end
+
+-- Find an active main-array enemy slot matching a Sprite ID (with slot hint).
+function findEnemyByID(id, slot_hint)
+    memory.usememorydomain("System Bus")
+    if slot_hint then
+        local b = SD_BASE + slot_hint * SD_STRIDE
+        if memory.read_u16_le(b + SD_F_STATUS) ~= 0
+           and memory.readbyte(b + SD_F_SPRID) == id then
+            return slot_hint
+        end
+    end
+    for slot = 0, SD_SLOTS - 1 do
+        local b = SD_BASE + slot * SD_STRIDE
+        if memory.read_u16_le(b + SD_F_STATUS) ~= 0
+           and memory.readbyte(b + SD_F_SPRID) == id then
+            return slot
+        end
+    end
+    return nil
+end
+
+-- Reconcile a received HP value against our local enemy, treating HP sync as a
+-- drift-correcting backstop rather than an authority:
+--   * remote slightly below local (<= HP_DRIFT_MAX): converge down (honor a hit
+--     that didn't register locally).
+--   * remote far below local: ignore — the other instance is likely mid phase
+--     transition; let our own game get there naturally.
+--   * remote >= local: ignore — never raise HP from sync; the game owns heals
+--     and phase resets (e.g. Yakuza 0->500).
+-- A remote kill (hp == 0) is only honored when our HP is already <= HP_KILL_GATE,
+-- so a death signal can't zero a boss that just reset to a new phase.
+-- kind "m" = main array (match by Sprite ID); "s" = sub-sprite (match by slot).
+function applyEnemyHP(kind, id, slot, hp)
+    memory.usememorydomain("System Bus")
+    local base
+    if kind == "s" then
+        if slot < 0 or slot >= SS_SLOTS then return end
+        base = SS_BASE + slot * SS_STRIDE
+        if memory.read_u32_le(base + SS_F_OAM) == 0 then return end
+    else
+        local s = findEnemyByID(id, slot)
+        if not s then return end
+        base = SD_BASE + s * SD_STRIDE
+    end
+    local hpoff = (kind == "s") and SS_F_HP or SD_F_HP
+    local cur = memory.read_u16_le(base + hpoff)
+    if hp >= cur then return end                      -- never raise HP (heals win)
+    if hp == 0 then
+        if cur <= HP_KILL_GATE then                   -- gated kill
+            memory.write_u16_le(base + hpoff, 0)
+        end
+        return
+    end
+    if (cur - hp) <= HP_DRIFT_MAX then                -- small drift: converge down
+        memory.write_u16_le(base + hpoff, hp)
+    end
+    -- large drop (not a kill): ignore — likely a phase transition in progress.
+end
+
 function collectSamusEntries(samus_sx, samus_sy)
     memory.usememorydomain("OAM")
     local entries = {}
@@ -785,6 +1116,8 @@ function collectSamusEntries(samus_sx, samus_sy)
         local cx   = oam_x + w / 2
         local cy   = oam_y + h / 2
 
+        -- Proximity: Samus body fits in ~±20px X, ±36px Y from her feet origin.
+        -- Shift center check 18px up from her feet to target her torso.
         local near_x  = math.abs(cx - samus_sx) < 24
         local near_y  = math.abs(cy - (samus_sy - 18)) < 40
         -- Palette: reject entries using palettes not associated with Samus.
@@ -822,7 +1155,13 @@ SPRITE_H = 80
 SPRITE_OX = 32   -- origin X within the bitmap (Samus centre column)
 SPRITE_OY = 64   -- origin Y within the bitmap (Samus feet row)
 
+-- Rasterize the given OAM entries into a flat indexed bitmap.
+-- Returns: pixels (array of palette-packed values), and a palette colour table.
+-- Each pixel value encodes (pal * 16 + colIdx); 0 = transparent.
+-- origin_sx/sy: Samus's screen position (entries are positioned relative to it).
 function rasterizeSamus(entries, origin_sx, origin_sy)
+    -- IMPORTANT: call getObjTileStride() FIRST (it switches to System Bus),
+    -- then set VRAM domain so tile reads below hit VRAM, not System Bus.
     local stride = getObjTileStride()
     memory.usememorydomain("VRAM")
     local buf = {}                 -- buf[1..W*H], 0 = transparent
@@ -1026,9 +1365,7 @@ end
 -- Pick the background layer that actually acts as the camera this frame and
 -- return Samus's screen position under it. We read all four BG scroll registers
 -- from the BGPositions table (0x30000C8: BG0 X/Y, +4 BG1, +8 BG2, +C BG3) and
--- choose the layer whose scroll places Samus on-screen. Normally BG0 is the
--- camera, but some rooms (e.g. water-effect rooms) drive the visual effect on
--- BG0 and scroll the level on BG1, so BG0 no longer matches the camera.
+-- choose the layer whose scroll places Samus on-screen.
 function selectCameraScreenPos(wx, wy)
     memory.usememorydomain("System Bus")
     local px, py = wx / 4, wy / 4
@@ -1041,6 +1378,8 @@ function selectCameraScreenPos(wx, wy)
         local sy = (py - cy) % 512; if sy > 256 then sy = sy - 512 end
         local on = (sx > -32 and sx < 272 and sy > -48 and sy < 200)
         if on then
+            -- Closeness to screen centre as a tiebreaker (lower is better),
+            -- turned into a higher-is-better score.
             local dxc = math.abs(sx - 120)
             local dyc = math.abs(sy - 80)
             local score = 1000 - (dxc + dyc)
@@ -1050,7 +1389,6 @@ function selectCameraScreenPos(wx, wy)
         end
     end
     if best_sx then return best_sx, best_sy end
-    
     local cx = memory.read_u16_le(0x30000C8)
     local cy = memory.read_u16_le(0x30000CA)
     local sx = (px - cx) % 512; if sx > 256 then sx = sx - 512 end
@@ -1062,8 +1400,7 @@ local function onFrameEnd()
     local wx    = readRAM("System Bus", 0x300125A, 2)
     local wy    = readRAM("System Bus", 0x300125C, 2)
     -- Camera: auto-select the BG layer that tracks Samus (BG0 normally; BG1 in
-    -- rooms where an effect screws BG0's scroll). This fixes positioning in
-    -- effect rooms without per-room special-casing.
+    -- rooms where an effect steals BG0's scroll).
     local samus_sx, samus_sy = selectCameraScreenPos(wx, wy)
 
     local my_area = readRAM("System Bus", 0x300002C, 1)
@@ -1104,8 +1441,7 @@ local function onFrameEnd()
            and pl.sprite
            and pl.sprite.buf
            and pl.sprite.argb then
-            -- Screen position relative to P1. samus_sx/sy now come from the
-            -- auto-selected camera layer, so this is correct in all rooms.
+            -- Screen position relative to P1.
             local world_dx = (pl.pos.x / 4) - (wx / 4)
             local world_dy = (pl.pos.y / 4) - (wy / 4)
             local sx = samus_sx + world_dx
