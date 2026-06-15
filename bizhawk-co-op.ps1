@@ -40,7 +40,7 @@ Remove-Item $filename
 
 #download bizhawk-co-op
 $url = "https://github.com/milesthenerd/bizhawk-co-op-metroid-fusion/archive/master.zip"
-$filename = "bizhawk-co-op.zip"
+$filename = "bizhawk-co-op-metroid-fusion-master.zip"
 Invoke-WebRequest -Uri $url -OutFile $filename
 #unzip
 $zip_file = $shell_app.namespace((Get-Location).Path + "\$filename")
@@ -49,8 +49,8 @@ $destination.Copyhere($zip_file.items())
 Remove-Item $filename
 
 #Copy files into Bizhawk
-Move-Item -Path .\bizhawk-co-op-$branch\* -Destination .\BizHawk-$version\
-Remove-Item .\bizhawk-co-op-$branch -Recurse
+Move-Item -Path .\bizhawk-co-op-metroid-fusion-$branch\* -Destination .\BizHawk-$version\
+Remove-Item .\bizhawk-co-op-metroid-fusion-$branch -Recurse
 
 Move-Item -Path .\luasocket\mime -Destination .\BizHawk-$version\
 Move-Item -Path .\luasocket\socket -Destination .\BizHawk-$version\

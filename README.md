@@ -4,7 +4,7 @@ bizhawk-co-op is a Lua script for BizHawk that allows two or more people to play
 
 ## Metroid Fusion Co-op
 
-Now supports metroid collection in Randovania.
+Now supports metroid collection in Randovania. Players can see each other and projectiles are also synced.
 
 Health and ammo is shared. Items obtained by a player are given to everyone, and items are removed from the room after reloading it. The map is shared and updates when opening/closing the pause menu and entering a room transition, but the current tile will glitch out if both players collect an item without the other reloading the room first. Events such as boss deaths, destroyed X-barriers, atmospheric stabilizers, eye doors, the Main Deck missile hatch, and water lowering are shared.
 
@@ -43,7 +43,7 @@ This works with the latest OoT Randomizer found on the website [https://www.ootr
 
 ## Setup
 There are two different methods to install.
-* Run the PowerShell script, Download it here: [bizhawk-co-op.ps1](https://github.com/lassiterm/bizhawk-co-op-metroid-fusion/releases/download/2.3/bizhawk-co-op.ps1). I suggest placing it wherever you want to install Bizhawk. To install it, right-click it and select "Run with PowerShell". This will download & install a fresh copy of BizHawk with all the required files in their correct locations.  
+* Run the PowerShell script, Download it here: [bizhawk-co-op.ps1](https://github.com/lassiterm/bizhawk-co-op-metroid-fusion/releases/download/2.8/bizhawk-co-op.ps1). I suggest placing it wherever you want to install Bizhawk. To install it, right-click it and select "Run with PowerShell". This will download & install a fresh copy of BizHawk with all the required files in their correct locations.  
 **OR**  
 * You can manually download the files, install and move them in the correct locations as described below.
 
@@ -96,8 +96,7 @@ Once you have everything else properly set up, you can run the bizhawk-coop scri
 Next, go to `Script -> Open Script...` and open `bizhawk co-op.lua` (it should be in `BizHawk-2.x/` root.) Make sure you are running a game, and then double click bizhawk co-op (or click it and then press the green check mark) to run the script. The window has the following important configurations:
 
 * Host IP and Port: The client should set the IP to the host's IP address, and both players must choose the same port number. The <ins>host</ins> will need to enable port forwarding on the chosen port, and will have to make sure their firewall is not blocking BizHawk. As for setting up port forwarding, Google is your best friend. 
-> > * <ins>Note:</ins> This may not apply to everyone but make sure you don't have `UPnP IGD` enabled on your router, this setting could prevent you from joining a host or hosting a room. 
-> > * <ins>Port forwarding alternative:</ins> "In the event you do not have access to your router to apply port forwarding, try using the program called, "[Hamachi](https://www.vpn.net/)". This program allows you & others to connect to one another as if you are on the same LAN (Local Area Network). Don't let the subscription stuff scare you on their site, all you need is a free account!"
+> > * <ins>Port forwarding alternative:</ins> "In the event you do not have access to your router to apply port forwarding, try using the program called, "[NATTunnel](https://github.com/milesthenerd/NATTunnel)". This program is like Hamachi/ZeroTier/Tailscale but completely free and if they were actually good at establishing direct P2P connections. Just make your Network ID and Network Secret match and that's all.
 
 * Game Script: Be sure to choose the appropriate game when creating the room or joining a room.
 
