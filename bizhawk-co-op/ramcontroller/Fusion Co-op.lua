@@ -571,13 +571,11 @@ function mf_ram.getMessage()
 	-- Enemy/boss HP sync: detect HP drops on local enemies this frame (our shots
 	-- landing) and broadcast the new HP keyed by Sprite ID, so the boss's health
 	-- pool is shared. We compare against last frame's snapshot; any enemy whose HP
-	-- decreased gets sent. pcall-guarded so an enemy-array hiccup can't kill the
-	-- rest of the message.
+	-- decreased gets sent.
 	pcall(function()
 		local cur = snapshotEnemies()
 		local prev = mf_ram.enemy_prev
 		-- Suppress ALL enemy sync across a room/area change: the array is reused
-		-- for different enemies, so diffs are meaningless and would mass-misfire.
 		local area = readRAM("System Bus", 0x300002C, 1)
 		local room = readRAM("System Bus", 0x300002D, 1)
 		local room_changed = (mf_ram.hp_last_room ~= room) or (mf_ram.hp_last_area ~= area)
@@ -586,12 +584,6 @@ function mf_ram.getMessage()
 			local hits = {}
 			for key, e in pairs(cur) do
 				local pe = prev[key]
-				-- Same entry still holds the same enemy and HP dropped, by a
-				-- plausible single-frame amount (guards against garbage reads).
-				-- Send the TRUE value, including 0: some entities (e.g. a Core-X
-				-- shell) CRACK at 0 HP rather than dying into an X, and need 0 to
-				-- propagate. Enemies that die into an X are additionally handled by
-				-- the full death-entry clone below, which lands the real death.
 				if pe and pe.id == e.id and e.hp < pe.hp then
 					hits[#hits + 1] = { k = e.kind, id = e.id, s = e.slot, hp = e.hp }
 				end
@@ -604,11 +596,7 @@ function mf_ram.getMessage()
 			-- DEATH CLONE: when an entity ENTERS its HP=0 transition this frame
 			-- (HP reached 0 while still present), capture its FULL entry — the
 			-- complete, game-authored state — and send it. The receiver writes it
-			-- over its matching entity, reproducing the exact transition (enemy
-			-- dissolve + X spawn, or a Core-X shell cracking) without us
-			-- reconstructing any fields. Covers BOTH arrays: main enemies (matched
-			-- by Sprite ID) and sub-sprites / boss parts like a Core-X shell
-			-- (matched by slot index). Capped to avoid mass-fire on a cull.
+			-- over its matching entity.
 			local deaths = {}
 			for key, e in pairs(cur) do
 				local pe = prev[key]
@@ -632,6 +620,98 @@ function mf_ram.getMessage()
 			end
 		end
 		mf_ram.enemy_prev = cur
+	end)
+
+	-- Item (tank) collection: when WE collect a world tank, tell the other player
+	-- so their LIVE room block is removed and they can't double-collect it.
+	pcall(function()
+		local flag = readRAM("System Bus", 0x3000026, 1)
+		if flag ~= 0 and (mf_ram.tank_flag_prev or 0) == 0 then
+			local sx = readRAM("System Bus", 0x300125A, 2)
+			local sy = readRAM("System Bus", 0x300125C, 2)
+			local stx = math.floor(sx / 64)
+			local sty = math.floor(sy / 64)
+			local area = readRAM("System Bus", 0x300002C, 1)
+			local room = readRAM("System Bus", 0x300002D, 1)
+			local width = readRAM("System Bus", 0x3000088, 2)
+			-- Samus may collect from a tile adjacent to the tank, so don't assume
+			-- her exact tile.
+			local tx, ty = stx, sty
+			if width and width > 0 then
+				memory.usememorydomain("System Bus")
+				local best
+				for dy = -1, 1 do
+					for dx = -1, 1 do
+						local x, y = stx + dx, sty + dy
+						if x >= 0 and y >= 0 and x < width then
+							local v = memory.read_u16_le(0x2026000 + (y * width + x) * 2)
+							if v ~= 0 and not best then best = { x = x, y = y, v = v } end
+						end
+					end
+				end
+				if best then tx, ty = best.x, best.y end
+			end
+			message["tank"] = { a = area, r = room, x = tx, y = ty }
+			changed = true
+		end
+		mf_ram.tank_flag_prev = flag
+	end)
+
+	-- Core-X dedupe: prevent both players absorbing the same Core-X (which would
+	-- duplicate the granted item, e.g. in randomizers).
+	pcall(function()
+		local area = readRAM("System Bus", 0x300002C, 1)
+		local room = readRAM("System Bus", 0x300002D, 1)
+		local same_room = (mf_ram.corex_area == area) and (mf_ram.corex_room == room)
+
+		-- Detect a savestate LOAD
+		local fc = readRAM("System Bus", 0x3000002, 2)
+		local loaded = false
+		if mf_ram.corex_fc ~= nil then
+			local delta = fc - mf_ram.corex_fc
+			if delta < -8 and delta > -65000 then loaded = true end
+		end
+		mf_ram.corex_fc = fc
+
+		-- Reset the per-room boss lifecycle on a room change OR a savestate load.
+		if not same_room or loaded then
+			mf_ram.boss_seen = false
+			mf_ram.boss_dead = false
+			mf_ram.corex_prev = nil
+		end
+
+		memory.usememorydomain("System Bus")
+		local corexId = readRAM("System Bus", 0x30006AD, 1)
+		local bossId  = readRAM("System Bus", 0x30006AC, 1)
+
+		-- Scan the main array once for presence of the Core-X and the boss sprites.
+		local corex_present, boss_present = false, false
+		for slot = 0, SD_SLOTS - 1 do
+			local base = SD_BASE + slot * SD_STRIDE
+			if memory.read_u16_le(base + SD_F_STATUS) ~= 0 then
+				local id = memory.readbyte(base + SD_F_SPRID)
+				if corexId ~= 0 and id == corexId then corex_present = true end
+				if bossId  ~= 0 and id == bossId  then boss_present = true end
+			end
+		end
+
+		-- Track the boss lifecycle: seen alive, then gone => defeated. The REWARD
+		-- Core-X (the one we dedupe) only appears AFTER the boss is defeated. The
+		-- FORMATION Core-X appears BEFORE the boss exists, so boss_dead is false
+		-- then and we correctly ignore its vanish
+		if boss_present then mf_ram.boss_seen = true end
+		if mf_ram.boss_seen and not boss_present then mf_ram.boss_dead = true end
+
+		-- Absorption = the Core-X that was present last frame is gone now, same
+		-- room, AND the boss has already been defeated (reward core, not formation).
+		if mf_ram.corex_prev and not corex_present and same_room and mf_ram.boss_dead
+		   and not loaded then
+			message["corex"] = { a = area, r = room, id = mf_ram.corex_prev }
+			changed = true
+		end
+
+		mf_ram.corex_prev = (corex_present and corexId) or nil
+		mf_ram.corex_area, mf_ram.corex_room = area, room
 	end)
 
 	-- Update the frame pointer
@@ -732,61 +812,104 @@ function mf_ram.processMessage(their_user, message)
 			if same_room then
 				local hits = message["hp"]
 				for _, h in pairs(hits) do
-					-- h = { k=kind, id=, s=slot, hp= }. Apply the synced HP value
-					-- (heal-aware reconcile in applyEnemyHP). HP=0 transitions
-					-- (enemy death into X, Core-X shell cracking) are driven by the
-					-- full-entry death clone (the "edie" handler below), which writes
-					-- the complete game-authored state — so here we just keep HP in
-					-- agreement and let the clone run the actual transition.
 					applyEnemyHP(h.k or "m", tonumber(h.id) or 0,
 					             tonumber(h.s) or 0, tonumber(h.hp))
 				end
 			end
 		end)
+		end
 
-		-- Death clone (inbound): the other instance sent a full dying-enemy entry.
-		-- Write it over our matching enemy so our game runs the exact same death
-		-- (dissolve + X spawn) from a complete, consistent, game-authored state —
-		-- replacing the field-poking that cascaded. Matched by Sprite ID; same-room
-		-- gated; capped; only applied to an enemy actually present.
-		if message["edie"] and their_user ~= config.user then
-			pcall(function()
-				local my_area = readRAM("System Bus", 0x300002C, 1)
-				local my_room = readRAM("System Bus", 0x300002D, 1)
-				local p = mf_ram.players[their_user]
-				local same_room = p and p.pos
-				                  and p.pos.area == my_area and p.pos.room == my_room
-				if same_room then
-					local deaths = message["edie"]
-					local done = 0
-					for _, d in pairs(deaths) do
-						if done < 3 and d.d then
-							local t = d.t or "m"
-							if t == "s" then
-								-- sub-sprite: matched by slot index
-								local slot = tonumber(d.s)
-								if slot and slot >= 0 and slot < SS_SLOTS then
-									memory.usememorydomain("System Bus")
-									local base = SS_BASE + slot * SS_STRIDE
-									if memory.read_u32_le(base + SS_F_OAM) ~= 0 then
-										writeSubEntry(slot, subEntryFromString(base64Decode(d.d)))
-										done = done + 1
-									end
-								end
-							else
-								-- main array: matched by Sprite ID
-								local id = tonumber(d.id) or 0
-								local slot = findEnemyByID(id, tonumber(d.s))
-								if slot then
-									writeEnemyEntry(slot, enemyEntryFromString(base64Decode(d.d)))
+	-- Death clone (inbound): the other instance sent a full dying-enemy entry.
+	-- Write it over our matching enemy so our game runs the exact same death
+	if message["edie"] and their_user ~= config.user then
+		pcall(function()
+			local my_area = readRAM("System Bus", 0x300002C, 1)
+			local my_room = readRAM("System Bus", 0x300002D, 1)
+			local p = mf_ram.players[their_user]
+			local same_room = p and p.pos
+			                  and p.pos.area == my_area and p.pos.room == my_room
+			if same_room then
+				local deaths = message["edie"]
+				local done = 0
+				for _, d in pairs(deaths) do
+					if done < 3 and d.d then
+						local t = d.t or "m"
+						if t == "s" then
+							-- sub-sprite: matched by slot index
+							local slot = tonumber(d.s)
+							if slot and slot >= 0 and slot < SS_SLOTS then
+								memory.usememorydomain("System Bus")
+								local base = SS_BASE + slot * SS_STRIDE
+								if memory.read_u32_le(base + SS_F_OAM) ~= 0 then
+									writeSubEntry(slot, subEntryFromString(base64Decode(d.d)))
 									done = done + 1
 								end
+							end
+						else
+							-- main array: matched by Sprite ID
+							local id = tonumber(d.id) or 0
+							local slot = findEnemyByID(id, tonumber(d.s))
+							if slot then
+								writeEnemyEntry(slot, enemyEntryFromString(base64Decode(d.d)))
+								done = done + 1
 							end
 						end
 					end
 				end
-			end)
-		end
+			end
+		end)
+	end
+
+	-- Item (tank) removal (inbound): the other player collected a world tank.
+	-- Remove the LIVE block in our room so we can't double-collect it. Clearing
+	-- the CLIPDATA tile removes collision
+	if message["tank"] and their_user ~= config.user then
+		pcall(function()
+			local my_area = readRAM("System Bus", 0x300002C, 1)
+			local my_room = readRAM("System Bus", 0x300002D, 1)
+			local t = message["tank"]
+			if tonumber(t.a) == my_area and tonumber(t.r) == my_room then
+				local width = readRAM("System Bus", 0x3000088, 2)
+				if width and width > 0 then
+					local x = tonumber(t.x) or 0
+					local y = tonumber(t.y) or 0
+					if x >= 0 and y >= 0 and x < width then
+						local idx = y * width + x
+						memory.usememorydomain("System Bus")
+						local clip = 0x2026000 + idx * 2
+						-- Only clear a tile that's currently a block (nonzero), so we
+						-- never punch a hole in open air / unrelated geometry.
+						if memory.read_u16_le(clip) ~= 0 then
+							memory.write_u16_le(clip, 0)                  -- collision off
+							memory.write_u16_le(0x202C000 + idx * 2, 0)   -- BG1 graphic (draws empty on refresh)
+						end
+					end
+				end
+			end
+		end)
+	end
+
+	-- Core-X dedupe (inbound): the other player absorbed their Core-X. Remove ours.
+	if message["corex"] and their_user ~= config.user then
+		pcall(function()
+			local my_area = readRAM("System Bus", 0x300002C, 1)
+			local my_room = readRAM("System Bus", 0x300002D, 1)
+			local c = message["corex"]
+			if tonumber(c.a) == my_area and tonumber(c.r) == my_room then
+				local id = tonumber(c.id) or 0
+				if id ~= 0 then
+					memory.usememorydomain("System Bus")
+					for slot = 0, SD_SLOTS - 1 do
+						local base = SD_BASE + slot * SD_STRIDE
+						if memory.read_u16_le(base + SD_F_STATUS) ~= 0
+						   and memory.readbyte(base + SD_F_SPRID) == id then
+							memory.write_u16_le(base + SD_F_STATUS, 0)   -- despawn
+							break
+						end
+					end
+				end
+			end
+		end)
 	end
 end
 
@@ -796,6 +919,13 @@ mf_ram.players      = {}    -- players[username] = {pos, sprite, argb, last_fram
 mf_ram.proj_active_prev = nil   -- previous-frame projectile active flags (fire sync)
 mf_ram.proj_injected    = {}    -- slots holding injected remote shots (don't re-send)
 mf_ram.enemy_prev       = nil   -- previous-frame enemy HP snapshot (HP sync)
+mf_ram.tank_flag_prev   = 0     -- previous-frame "collecting tank flag" (item removal)
+mf_ram.corex_prev       = nil   -- Core-X sprite id present last frame (dedupe)
+mf_ram.corex_area       = nil
+mf_ram.corex_room       = nil
+mf_ram.boss_seen        = false -- saw the boss sprite alive this room
+mf_ram.boss_dead        = false -- boss was alive then vanished (defeated) this room
+mf_ram.corex_fc         = nil   -- last frame counter (detects savestate load)
 
 OAM_SIZES = {
     [0] = {{8,8},{16,16},{32,32},{64,64}},
