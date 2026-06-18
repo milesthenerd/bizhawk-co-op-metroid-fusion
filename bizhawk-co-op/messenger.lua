@@ -2,6 +2,36 @@
 --author: TheOnlyOne
 local messenger = {}
 
+--Per-socket partial-line buffer. Without this the head of a split message is lost
+--(TCP stream joy), giving "unidentifiable message" errors. Weak keys so a
+--closed socket's buffer is collected.
+local recv_buffer = setmetatable({}, {__mode = "k"})
+
+--Read one complete '\n'-terminated message, holding any partial for next time.
+--Returns (message, nil), (nil, "timeout") if incomplete, or (nil, err) on a
+--socket error. Trailing '\n' stripped, like the replaced receive("*l").
+local function receive_line(client_socket)
+  local line, err, partial = client_socket:receive("*l")
+  if line ~= nil then
+    local buffered = recv_buffer[client_socket]
+    if buffered then
+      recv_buffer[client_socket] = nil
+      return buffered .. line, nil
+    end
+    return line, nil
+  end
+
+  if err == "timeout" then
+    if partial and partial ~= "" then
+      recv_buffer[client_socket] = (recv_buffer[client_socket] or "") .. partial
+    end
+    return nil, "timeout"
+  end
+
+  recv_buffer[client_socket] = nil
+  return nil, err
+end
+
 --list of message types
 messenger.ERROR = -1
 messenger.MEMORY = 0
@@ -270,11 +300,11 @@ function messenger.receive(client_socket, nonblocking)
   --get the next message
   local message, err
   if nonblocking then
-    message, err = client_socket:receive()
+    message, err = receive_line(client_socket)
   else
     local init = os.time()
     repeat
-      message, err = client_socket:receive()
+      message, err = receive_line(client_socket)
       coroutine.yield()
     until err == nil or err ~= "timeout" or os.difftime(os.time(), init) >= 5
   end

@@ -1,3 +1,5 @@
+local mf_ram = {}
+
 -- Writes value to RAM using little endian
 function writeRAM(domain, address, size, value)
 	memory.usememorydomain(domain)
@@ -241,20 +243,48 @@ function eventAmmoChange(prevRam, newRam)
 		-- If alive, send delta changes. Don't check for capacities (handled in tank event)
 		deltaammo.delta = true
 
+		-- If a positive capacity rise matches a pending shared-reward
+		-- credit (the other player already granted us this exact reward via sync),
+		-- it's a DUPLICATE physical collect/absorb of the same item. Consume the
+		-- credit, revert our local capacity (RAM + newRam so we don't re-gain), and
+		-- return true to suppress sending the delta. Otherwise return false.
+		local function consumeCredit(kind, curAddr, capAddr, curSize, newCap, prevCap)
+			mf_ram.cap_credit = mf_ram.cap_credit or {}
+			local rise = newCap - prevCap
+			local credit = mf_ram.cap_credit[kind] or 0
+			if rise > 0 and credit >= rise then
+				mf_ram.cap_credit[kind] = credit - rise
+				writeRAM("System Bus", capAddr, 2, prevCap)   -- revert the duplicate max bump
+				newRam.ammo[kind .. "Capacity"] = prevCap     -- keep sync state consistent
+				local cur = readRAM("System Bus", curAddr, curSize)
+				local newCur = math.max(0, math.min(cur - rise, prevCap))
+				writeRAM("System Bus", curAddr, curSize, newCur)
+				newRam.ammo[kind .. "Count"] = newCur
+				return true
+			end
+			return false
+		end
+
 		-- Check energy capacity changes
 		if (newRam.ammo.energyCapacity ~= prevRam.ammo.energyCapacity) then
-			deltaammo.energyCapacity = newRam.ammo.energyCapacity - prevRam.ammo.energyCapacity
-			changed = true			
+			if not consumeCredit("energy", 0x3001310, 0x3001312, 2, newRam.ammo.energyCapacity, prevRam.ammo.energyCapacity) then
+				deltaammo.energyCapacity = newRam.ammo.energyCapacity - prevRam.ammo.energyCapacity
+				changed = true			
+			end
 		end
 		-- Check missile capacity changes
 		if (newRam.ammo.missileCapacity ~= prevRam.ammo.missileCapacity) then
-			deltaammo.missileCapacity = newRam.ammo.missileCapacity - prevRam.ammo.missileCapacity
-			changed = true			
+			if not consumeCredit("missile", 0x3001314, 0x3001316, 2, newRam.ammo.missileCapacity, prevRam.ammo.missileCapacity) then
+				deltaammo.missileCapacity = newRam.ammo.missileCapacity - prevRam.ammo.missileCapacity
+				changed = true			
+			end
 		end
 		-- Check power capacity changes
 		if (newRam.ammo.powerCapacity ~= prevRam.ammo.powerCapacity) then
-			deltaammo.powerCapacity = newRam.ammo.powerCapacity - prevRam.ammo.powerCapacity
-			changed = true			
+			if not consumeCredit("power", 0x3001318, 0x3001319, 1, newRam.ammo.powerCapacity, prevRam.ammo.powerCapacity) then
+				deltaammo.powerCapacity = newRam.ammo.powerCapacity - prevRam.ammo.powerCapacity
+				changed = true			
+			end
 		end		
 		-- Check energy count changes
 		if (newRam.ammo.energyCount ~= prevRam.ammo.energyCount) then
@@ -413,6 +443,21 @@ function setAmmo(prevAmmo, deltaAmmo)
 		-- If incremental delta changes, add values to current values
 		-- deltas may be negative to subtract
 		-- bound the updated values with the capacity and 0
+		-- A positive capacity delta is a shared reward the other player earned.
+		-- Record a pending credit per type once per player. Skip on fromTank=true
+		if not deltaAmmo.fromTank then
+			mf_ram.cap_credit = mf_ram.cap_credit or {}
+			if (deltaAmmo.energyCapacity or 0) > 0 then
+				mf_ram.cap_credit.energy = (mf_ram.cap_credit.energy or 0) + deltaAmmo.energyCapacity
+			end
+			if (deltaAmmo.missileCapacity or 0) > 0 then
+				mf_ram.cap_credit.missile = (mf_ram.cap_credit.missile or 0) + deltaAmmo.missileCapacity
+			end
+			if (deltaAmmo.powerCapacity or 0) > 0 then
+				mf_ram.cap_credit.power = (mf_ram.cap_credit.power or 0) + deltaAmmo.powerCapacity
+			end
+		end
+
 		newAmmo.energyCapacity = math.max(prevAmmo.energyCapacity + 
 			(deltaAmmo.energyCapacity or 0), 0)
 		newAmmo.missileCapacity = math.max(prevAmmo.missileCapacity + 
@@ -445,8 +490,7 @@ function setAmmo(prevAmmo, deltaAmmo)
 	return newAmmo
 end
 
--- Object that exposes the public functions
-local mf_ram = {}
+-- Object that exposes the public functions (declared at top of file)
 
 -- RAM state from previous frame
 local prevRAM = {
@@ -481,6 +525,60 @@ function mf_ram.getMessage()
 	local changed = false
 	local newTank
 
+	-- Tank collection detection lifecycle:
+	--   normal tank:  0x0062 ----------------> 0x0000   (collect)
+	--   hidden tank:  0x0065 -> 0x801D -------> 0x0000   (reveal, then collect)
+	-- We notify the other player ONLY on actual collection (tile reaches 0x0000),
+	-- identified by watching tiles that have held a tank value (0x62-0x6A).
+	local TANK_VALS = {
+		[0x62] = true,  -- missile tank
+		[0x63] = true,  -- energy tank
+		[0x64] = true,  -- hidden missile tank
+		[0x65] = true,  -- hidden energy tank
+		[0x66] = true,  -- underwater missile tank
+		[0x67] = true,  -- underwater energy tank
+		[0x68] = true,  -- power bomb tank
+		[0x69] = true,  -- hidden power bomb tank
+		[0x6A] = true,  -- underwater power bomb tank
+	}
+	do
+		local width = readRAM("System Bus", 0x3000088, 2)
+		if width and width > 0 then
+			local area = readRAM("System Bus", 0x300002C, 1)
+			local room = readRAM("System Bus", 0x300002D, 1)
+			memory.usememorydomain("System Bus")
+
+			local REGION_TILES = 0x1800
+			local same_room = (mf_ram.clip_area == area) and (mf_ram.clip_room == room)
+			local armed = (same_room and mf_ram.tank_armed) or {}  -- { [idx] = true }
+
+			local clip = memory.readbyterange(0x2026000, REGION_TILES * 2)
+			-- readbyterange may be 0- or 1-indexed depending on BizHawk version;
+			-- detect once by probing for a [0] key.
+			local b0 = (clip[0] ~= nil) and 0 or 1
+
+			-- Single pass: arm tiles holding a tank value, and detect armed tiles
+			-- that have gone empty (collected).
+			for idx = 0, REGION_TILES - 1 do
+				local p = b0 + idx * 2
+				local v = clip[p] + clip[p + 1] * 256
+				if TANK_VALS[v] then
+					armed[idx] = true
+				elseif v == 0 and armed[idx] and same_room then
+					local x = idx % width
+					local y = math.floor(idx / width)
+					message["tank"] = { a = area, r = room, x = x, y = y }
+					changed = true
+					armed[idx] = nil
+				end
+			end
+
+			mf_ram.tank_armed = armed
+			mf_ram.clip_area = area
+			mf_ram.clip_room = room
+		end
+	end
+
 	-- Gets the message for a new collected tank
 	-- Also updates the states to squelch some changes
 	newTank = eventTankCollected()
@@ -509,7 +607,16 @@ function mf_ram.getMessage()
 	-- Gets the message for all updated ammo count/capacity
 	local newAmmo = eventAmmoChange(prevRAM, newRAM)
 	if newAmmo then
-		-- Add new changes
+		-- Tag capacity changes that came from a world tank collect using the
+		-- "Collecting tank flag" (0x3000026), which is set during world tank
+		-- collection and NOT during Core-X absorbs. This stays set for multiple
+		-- frames so it's reliable even if the capacity update lags CollectedTank
+		-- by a frame. The receiver uses this tag to skip arming a duplicate-absorb
+		-- credit — world tanks are handled by tile removal; the credit is only
+		-- needed for Core-X rewards where both players can absorb their own copy.
+		if readRAM("System Bus", 0x3000026, 1) ~= 0 then
+			newAmmo.fromTank = true
+		end
 		message["m"] = newAmmo
 		changed = true
 	end
@@ -544,29 +651,31 @@ function mf_ram.getMessage()
 		changed = true
 	end
 
-	-- Projectile fire sync: broadcast shots we fired this frame.
-	pcall(function()
-		local cur = snapshotProjActive()
-		if mf_ram.proj_injected then
-			for slot in pairs(mf_ram.proj_injected) do
-				if not cur[slot] then mf_ram.proj_injected[slot] = nil end
-			end
-		end
-		local newly = findNewlyActiveSlots(mf_ram.proj_active_prev)
-		mf_ram.proj_active_prev = cur
-		if #newly > 0 then
-			local fires = {}
-			for _, slot in ipairs(newly) do
-				if not (mf_ram.proj_injected and mf_ram.proj_injected[slot]) then
-					fires[#fires + 1] = base64Encode(projEntryToString(readProjEntry(slot)))
+	-- Projectile fire sync: DISABLED.
+	if mf_ram.PROJ_SYNC then
+		pcall(function()
+			local cur = snapshotProjActive()
+			if mf_ram.proj_injected then
+				for slot in pairs(mf_ram.proj_injected) do
+					if not cur[slot] then mf_ram.proj_injected[slot] = nil end
 				end
 			end
-			if #fires > 0 then
-				message["fire"] = { e = fires }
-				changed = true
+			local newly = findNewlyActiveSlots(mf_ram.proj_active_prev)
+			mf_ram.proj_active_prev = cur
+			if #newly > 0 then
+				local fires = {}
+				for _, slot in ipairs(newly) do
+					if not (mf_ram.proj_injected and mf_ram.proj_injected[slot]) then
+						fires[#fires + 1] = base64Encode(projEntryToString(readProjEntry(slot)))
+					end
+				end
+				if #fires > 0 then
+					message["fire"] = { e = fires }
+					changed = true
+				end
 			end
-		end
-	end)
+		end)
+	end
 
 	-- Enemy/boss HP sync: detect HP drops on local enemies this frame (our shots
 	-- landing) and broadcast the new HP keyed by Sprite ID, so the boss's health
@@ -622,41 +731,6 @@ function mf_ram.getMessage()
 		mf_ram.enemy_prev = cur
 	end)
 
-	-- Item (tank) collection: when WE collect a world tank, tell the other player
-	-- so their LIVE room block is removed and they can't double-collect it.
-	pcall(function()
-		local flag = readRAM("System Bus", 0x3000026, 1)
-		if flag ~= 0 and (mf_ram.tank_flag_prev or 0) == 0 then
-			local sx = readRAM("System Bus", 0x300125A, 2)
-			local sy = readRAM("System Bus", 0x300125C, 2)
-			local stx = math.floor(sx / 64)
-			local sty = math.floor(sy / 64)
-			local area = readRAM("System Bus", 0x300002C, 1)
-			local room = readRAM("System Bus", 0x300002D, 1)
-			local width = readRAM("System Bus", 0x3000088, 2)
-			-- Samus may collect from a tile adjacent to the tank, so don't assume
-			-- her exact tile.
-			local tx, ty = stx, sty
-			if width and width > 0 then
-				memory.usememorydomain("System Bus")
-				local best
-				for dy = -1, 1 do
-					for dx = -1, 1 do
-						local x, y = stx + dx, sty + dy
-						if x >= 0 and y >= 0 and x < width then
-							local v = memory.read_u16_le(0x2026000 + (y * width + x) * 2)
-							if v ~= 0 and not best then best = { x = x, y = y, v = v } end
-						end
-					end
-				end
-				if best then tx, ty = best.x, best.y end
-			end
-			message["tank"] = { a = area, r = room, x = tx, y = ty }
-			changed = true
-		end
-		mf_ram.tank_flag_prev = flag
-	end)
-
 	-- Core-X dedupe: prevent both players absorbing the same Core-X (which would
 	-- duplicate the granted item, e.g. in randomizers).
 	pcall(function()
@@ -678,6 +752,9 @@ function mf_ram.getMessage()
 			mf_ram.boss_seen = false
 			mf_ram.boss_dead = false
 			mf_ram.corex_prev = nil
+			-- Also drop any pending capacity credits: a reward not duplicated within
+			-- its room is left behind
+			mf_ram.cap_credit = {}
 		end
 
 		memory.usememorydomain("System Bus")
@@ -780,8 +857,8 @@ function mf_ram.processMessage(their_user, message)
 		end
 	end
 
-	-- Projectile fire sync (inbound)
-	if message["fire"] and their_user ~= config.user then
+	-- Projectile fire sync (inbound): DISABLED (see send-side note).
+	if mf_ram.PROJ_SYNC and message["fire"] and their_user ~= config.user then
 		pcall(function()
 			local fire = message["fire"]
 			local my_area = readRAM("System Bus", 0x300002C, 1)
@@ -877,11 +954,9 @@ function mf_ram.processMessage(their_user, message)
 						local idx = y * width + x
 						memory.usememorydomain("System Bus")
 						local clip = 0x2026000 + idx * 2
-						-- Only clear a tile that's currently a block (nonzero), so we
-						-- never punch a hole in open air / unrelated geometry.
 						if memory.read_u16_le(clip) ~= 0 then
-							memory.write_u16_le(clip, 0)                  -- collision off
-							memory.write_u16_le(0x202C000 + idx * 2, 0)   -- BG1 graphic (draws empty on refresh)
+							memory.write_u16_le(clip, 0)
+							memory.write_u16_le(0x202C000 + idx * 2, 0)
 						end
 					end
 				end
@@ -898,13 +973,14 @@ function mf_ram.processMessage(their_user, message)
 			if tonumber(c.a) == my_area and tonumber(c.r) == my_room then
 				local id = tonumber(c.id) or 0
 				if id ~= 0 then
+					-- The other player absorbed this Core-X. Despawn our copy so our
+					-- player can't also absorb it (varies in efficacy so the capacity credit exists).
 					memory.usememorydomain("System Bus")
 					for slot = 0, SD_SLOTS - 1 do
 						local base = SD_BASE + slot * SD_STRIDE
 						if memory.read_u16_le(base + SD_F_STATUS) ~= 0
 						   and memory.readbyte(base + SD_F_SPRID) == id then
 							memory.write_u16_le(base + SD_F_STATUS, 0)   -- despawn
-							break
 						end
 					end
 				end
@@ -918,14 +994,17 @@ mf_ram.my_last_pos  = nil   -- tracks last sent pos to throttle pos messages
 mf_ram.players      = {}    -- players[username] = {pos, sprite, argb, last_frame}
 mf_ram.proj_active_prev = nil   -- previous-frame projectile active flags (fire sync)
 mf_ram.proj_injected    = {}    -- slots holding injected remote shots (don't re-send)
+mf_ram.PROJ_SYNC        = false -- projectile fire sync OFF: injected beams hit the
+                                -- engine's per-type on-screen cap and block local
+                                -- firing, and add no mechanic (HP sync covers damage)
 mf_ram.enemy_prev       = nil   -- previous-frame enemy HP snapshot (HP sync)
-mf_ram.tank_flag_prev   = 0     -- previous-frame "collecting tank flag" (item removal)
 mf_ram.corex_prev       = nil   -- Core-X sprite id present last frame (dedupe)
 mf_ram.corex_area       = nil
 mf_ram.corex_room       = nil
 mf_ram.boss_seen        = false -- saw the boss sprite alive this room
 mf_ram.boss_dead        = false -- boss was alive then vanished (defeated) this room
 mf_ram.corex_fc         = nil   -- last frame counter (detects savestate load)
+mf_ram.cap_credit       = {}    -- pending shared-reward capacity credits (dup cancel)
 
 OAM_SIZES = {
     [0] = {{8,8},{16,16},{32,32},{64,64}},
@@ -1538,12 +1617,15 @@ local function onFrameEnd()
 
     local my_anim  = readRAM("System Bus", 0x3001266, 1)
     local my_pose  = readRAM("System Bus", 0x3001245, 1)
-    local my_ctr   = readRAM("System Bus", 0x3001265, 1)  -- animation frame counter
     local now      = readRAM("System Bus", 0x3000002, 2)  -- frame counter
     local my_dir   = readRAM("System Bus", 0x3001256, 2)
-    local my_sig   = my_anim .. ":" .. my_pose .. ":" .. my_ctr .. ":" .. my_dir
+    -- Sprite signature deliberately EXCLUDES the animation frame counter
+    -- (0x3001265).
+    local my_sig   = my_anim .. ":" .. my_pose .. ":" .. my_dir
+    -- ~8 frames keeps the overlay smooth enough without unnecessary load
+    local SPRITE_REBUILD_GAP = 8
     local gap_ok   = (not mf_ram.my_built_frame)
-                     or ((now - mf_ram.my_built_frame) % 65536 >= 4)
+                     or ((now - mf_ram.my_built_frame) % 65536 >= SPRITE_REBUILD_GAP)
     if my_sig ~= mf_ram.my_built_sig and gap_ok then
         local p1_entries = collectSamusEntries(samus_sx, samus_sy)
         mf_ram.my_hflip = p1_entries[1] and p1_entries[1].hflip or 0
@@ -1561,8 +1643,9 @@ local function onFrameEnd()
     end
 
     for user, pl in pairs(mf_ram.players) do
+        -- Cull a player whose updates stopped.
         local stale = pl.last_frame
-                      and ((now - pl.last_frame) % 65536 > 120)  -- ~2s at 60fps
+                      and ((now - pl.last_frame) % 65536 > 75)
         if stale then
             mf_ram.players[user] = nil
         elseif pl.pos

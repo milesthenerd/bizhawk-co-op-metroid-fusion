@@ -7,6 +7,9 @@ local sha1 = require("bizhawk-co-op\\sha1")
 local ram_controller
 local sync_hashes = {}
 
+--max messages to drain from each client per frame to avoid emulator freezes
+local MAX_RECV_PER_FRAME = 32
+
 my_ID = nil
 
 
@@ -281,9 +284,17 @@ function sync.syncRAM()
       end
     end
 
-    --receive this frame's input from the other player and other messages
+    --receive this frame's input and other messages. Drain several per client:
+    --TCP coalesces messages into one read and LuaSocket returns them one per
+    --receive() call, so pulling only one per frame builds a backlog.
     for clientID, client in pairs(host.clients) do
+     for _drain = 1, MAX_RECV_PER_FRAME do
       local received_message_type, their_user, received_data = messenger.receive(client, true)
+
+      -- no more messages buffered for this client this frame
+      if (received_message_type == nil) then
+        break
+      end
 
       -- close client on error
       if (received_message_type == messenger.ERROR) then
@@ -361,6 +372,7 @@ function sync.syncRAM()
       else
         error("Unexpected message type received.")
       end
+     end
     end
 
     coroutine.yield()
