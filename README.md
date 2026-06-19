@@ -4,7 +4,7 @@ bizhawk-co-op is a Lua script for BizHawk that allows two or more people to play
 
 ## Metroid Fusion Co-op
 
-Now supports metroid collection in Randovania. Players can see each other and projectiles are also synced.
+Now supports metroid collection in Randovania. Players can see each other and enemies/bosses *vaguely* have their health synced in the same room.
 
 Health and ammo is shared. Items obtained by a player are given to everyone, and items are removed from the room after reloading it. The map is shared and updates when opening/closing the pause menu and entering a room transition, but the current tile will glitch out if both players collect an item without the other reloading the room first. Events such as boss deaths, destroyed X-barriers, atmospheric stabilizers, eye doors, the Main Deck missile hatch, and water lowering are shared.
 
