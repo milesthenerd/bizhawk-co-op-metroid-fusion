@@ -1482,10 +1482,17 @@ function rleDecode(str)
     local buf = {}
     local n = #str
     local i = 1
-    while i < n do
+    -- Cap at the sprite's real pixel count
+    local limit = SPRITE_W * SPRITE_H
+    local count = 0
+    while i < n and count < limit do
         local v   = string.byte(str, i)
         local run = string.byte(str, i + 1)
-        for _ = 1, run do buf[#buf + 1] = v end
+        if run > limit - count then run = limit - count end
+        for _ = 1, run do
+            count = count + 1
+            buf[count] = v
+        end
         i = i + 2
     end
     return buf
@@ -1627,21 +1634,28 @@ local function onFrameEnd()
     local gap_ok   = (not mf_ram.my_built_frame)
                      or ((now - mf_ram.my_built_frame) % 65536 >= SPRITE_REBUILD_GAP)
     if my_sig ~= mf_ram.my_built_sig and gap_ok then
+        -- Record the signature and rebuild time every time
+        mf_ram.my_built_sig   = my_sig
+        mf_ram.my_built_frame = now
+
         local p1_entries = collectSamusEntries(samus_sx, samus_sy)
         mf_ram.my_hflip = p1_entries[1] and p1_entries[1].hflip or 0
         if #p1_entries > 0 then
-            local buf    = rasterizeSamus(p1_entries, samus_sx, samus_sy)
-            local sprite = {
-                rle = base64Encode(rleEncode(buf)),
-                pal = base64Encode(capturePalettes()),
-            }
-            mf_ram.my_sprite       = sprite
-            mf_ram.my_built_sig    = my_sig
-            mf_ram.my_built_frame  = now
-            mf_ram.my_sprite_dirty = true
+            local rle = base64Encode(rleEncode(rasterizeSamus(p1_entries, samus_sx, samus_sy)))
+            local pal = base64Encode(capturePalettes())
+            -- Only flag a network resend when the encoded bitmap or palette
+            -- ACTUALLY changed
+            if rle ~= mf_ram.my_sent_rle or pal ~= mf_ram.my_sent_pal then
+                mf_ram.my_sprite       = { rle = rle, pal = pal }
+                mf_ram.my_sent_rle     = rle
+                mf_ram.my_sent_pal     = pal
+                mf_ram.my_sprite_dirty = true
+            end
         end
     end
 
+    -- Clear other players' sprites if they are no longer in the same room
+    local todraw = {}
     for user, pl in pairs(mf_ram.players) do
         -- Cull a player whose updates stopped.
         local stale = pl.last_frame
@@ -1657,11 +1671,21 @@ local function onFrameEnd()
             -- Screen position relative to P1.
             local world_dx = (pl.pos.x / 4) - (wx / 4)
             local world_dy = (pl.pos.y / 4) - (wy / 4)
-            local sx = samus_sx + world_dx
-            local sy = samus_sy + world_dy
-            drawBitmap(pl.sprite.buf, pl.sprite.argb, sx, sy)
+            todraw[#todraw + 1] = {
+                pl = pl,
+                sx = samus_sx + world_dx,
+                sy = samus_sy + world_dy,
+            }
         end
     end
+
+    if #todraw > 0 or mf_ram.drew_last_frame then
+        gui.clearGraphics()
+        for _, d in ipairs(todraw) do
+            drawBitmap(d.pl.sprite.buf, d.pl.sprite.argb, d.sx, d.sy)
+        end
+    end
+    mf_ram.drew_last_frame = (#todraw > 0)
 end
 
 mf_ram.frame_handler_id = event.onframeend(onFrameEnd, "mf_coop_frame")
