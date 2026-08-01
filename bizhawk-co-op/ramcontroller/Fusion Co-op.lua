@@ -60,6 +60,9 @@ function difference(a, b)
     return ret
 end
 
+-- Omega Metroid vulnerability latch (see getEvents)
+local omegaVulnPending = false
+
 local abilityRAM = readRAM("System Bus", 0x300131A, 4)
 local tankRAM = readRAMRange("System Bus", 0x2037200, 0xA00)
 local mapRAM = readRAMRange("System Bus", 0x2037C00, 0x400)
@@ -156,9 +159,27 @@ function getEvents()
 		waterFlag = readRAM("System Bus", 0x30006B9, 1)
 	end
 
-	if(readRAM("System Bus", 0x3000B87, 1) == 0x67) then
-		writeRAM("System Bus", 0x3000B87, 1, 0x69)
+	if(readRAM("System Bus", 0x3000B87, 1) == 0x69) then -- orbit changed event
+		writeRAM("System Bus", 0x3000B87, 1, 0x6B) -- set to after omega kills SA-X
 		events[12] = readRAM("System Bus", 0x3000B87, 1)
+		omegaVulnPending = true
+	end
+
+	-- Latch the omega metroid vuln check by retrying every frame
+	-- Disarm once 0x3000B87 reaches 0x6C (omega dead)
+	if readRAM("System Bus", 0x3000B87, 1) == 0x6C then
+		omegaVulnPending = false
+	end
+	if omegaVulnPending then
+		memory.usememorydomain("System Bus")
+		for slot = 0, SD_SLOTS - 1 do
+			local base = SD_BASE + slot * SD_STRIDE
+			if memory.read_u16_le(base + SD_F_STATUS) ~= 0
+			   and memory.readbyte(base + SD_F_SPRID) == 0xC3 then
+				memory.writebyte(base + SD_F_PROP, 0x00)
+				break
+			end
+		end
 	end
 
 	if(metroidCounter ~= readRAM("System Bus", 0x300003E, 1)) then
@@ -423,6 +444,11 @@ function setEvent(prevEvent, newEvent)
 
 	if(newEvent[12] ~= nil) then
 		writeRAM("System Bus", 0x3000B87, 1, newEvent[12])
+
+		-- Arm the omega metroid vulnerability latch
+		if newEvent[12] == 0x6B then
+			omegaVulnPending = true
+		end
 	end
 
 	if(newEvent[13] ~= nil) then
@@ -1116,6 +1142,7 @@ SD_F_SPRID  = 0x1D
 SD_F_POSE   = 0x24
 SD_F_XPOS   = 0x04
 SD_F_YPOS   = 0x02
+SD_F_PROP   = 0x34
 
 -- Sub-sprite array: parts of composite bosses (e.g. Yakuza) keep their HP here,
 -- NOT in the main array. Exactly two fixed slots, 16 bytes each:
@@ -1368,11 +1395,35 @@ SPRITE_OY = 64   -- origin Y within the bitmap (Samus feet row)
 -- Returns: pixels (array of palette-packed values), and a palette colour table.
 -- Each pixel value encodes (pal * 16 + colIdx); 0 = transparent.
 -- origin_sx/sy: Samus's screen position (entries are positioned relative to it).
+-- Cache of decoded tiles for this rasterize call, keyed by tile number.
+local __tileCache = {}
+
+-- Decode one 8x8 4bpp tile's 32 raw bytes
+local function decodeTile(tileNum)
+    local cached = __tileCache[tileNum]
+    if cached then return cached end
+    local tileAddr = 0x10000 + tileNum * 32
+    local bytes = memory.readbyterange(tileAddr, 32)  -- 0-indexed
+    local b0 = (bytes[0] ~= nil) and 0 or 1
+    local px = {}
+    for py = 0, 7 do
+        local rowBase = py * 4
+        for bi = 0, 3 do
+            local b = bytes[b0 + rowBase + bi]
+            px[py * 8 + bi * 2 + 1] = bit.band(b, 0xF)
+            px[py * 8 + bi * 2 + 2] = bit.band(bit.rshift(b, 4), 0xF)
+        end
+    end
+    __tileCache[tileNum] = px
+    return px
+end
+
 function rasterizeSamus(entries, origin_sx, origin_sy)
     -- IMPORTANT: call getObjTileStride() FIRST (it switches to System Bus),
     -- then set VRAM domain so tile reads below hit VRAM, not System Bus.
     local stride = getObjTileStride()
     memory.usememorydomain("VRAM")
+    __tileCache = {}
     local buf = {}                 -- buf[1..W*H], 0 = transparent
     for i = 1, SPRITE_W * SPRITE_H do buf[i] = 0 end
 
@@ -1389,28 +1440,21 @@ function rasterizeSamus(entries, origin_sx, origin_sy)
                 local srcTx = (e.hflip == 1) and (tilesW - 1 - tx) or tx
                 local tileNum = e.tile + srcTy * rowStride + srcTx
                 if tileNum < SAMUS_TILE_MAX then
-                    local tileAddr = 0x10000 + tileNum * 32
+                    local tilePx = decodeTile(tileNum)
                     for py = 0, 7 do
                         local fpy = (e.vflip == 1) and (7 - py) or py
-                        for px = 0, 7 do
-                            local byteOff = tileAddr + py * 4 + math.floor(px / 2)
-                            if byteOff >= 0x10000 and byteOff < 0x18000 then
-                                local b = memory.read_u8(byteOff)
-                                local colIdx = (px % 2 == 0)
-                                               and bit.band(b, 0xF)
-                                               or  bit.band(bit.rshift(b, 4), 0xF)
+                        local rel_y = (e.y + ty * 8 + fpy) - oy
+                        local by = rel_y + SPRITE_OY
+                        if by >= 0 and by < SPRITE_H then
+                            local rowOff = by * SPRITE_W
+                            for px = 0, 7 do
+                                local colIdx = tilePx[py * 8 + px + 1]
                                 if colIdx ~= 0 then
                                     local fpx = (e.hflip == 1) and (7 - px) or px
-                                    -- Screen position of this pixel relative to origin
                                     local rel_x = (e.x + tx * 8 + fpx) - ox
-                                    local rel_y = (e.y + ty * 8 + fpy) - oy
-                                    -- Map into bitmap space
                                     local bx = rel_x + SPRITE_OX
-                                    local by = rel_y + SPRITE_OY
-                                    if bx >= 0 and bx < SPRITE_W
-                                       and by >= 0 and by < SPRITE_H then
-                                        local idx = by * SPRITE_W + bx + 1
-                                        buf[idx] = e.pal * 16 + colIdx
+                                    if bx >= 0 and bx < SPRITE_W then
+                                        buf[rowOff + bx + 1] = e.pal * 16 + colIdx
                                     end
                                 end
                             end
@@ -1573,9 +1617,9 @@ function drawBitmap(buf, argb, sx, sy)
     end
 end
 
-if mf_ram.frame_handler_id then
-    pcall(function() event.unregisterbyid(mf_ram.frame_handler_id) end)
-    mf_ram.frame_handler_id = nil
+if MF_COOP_FRAME_HANDLER_ID then
+    pcall(function() event.unregisterbyid(MF_COOP_FRAME_HANDLER_ID) end)
+    MF_COOP_FRAME_HANDLER_ID = nil
 end
 
 -- Pick the background layer that actually acts as the camera this frame and
@@ -1641,7 +1685,8 @@ local function onFrameEnd()
         local p1_entries = collectSamusEntries(samus_sx, samus_sy)
         mf_ram.my_hflip = p1_entries[1] and p1_entries[1].hflip or 0
         if #p1_entries > 0 then
-            local rle = base64Encode(rleEncode(rasterizeSamus(p1_entries, samus_sx, samus_sy)))
+            local rasterized = rasterizeSamus(p1_entries, samus_sx, samus_sy)
+            local rle = base64Encode(rleEncode(rasterized))
             local pal = base64Encode(capturePalettes())
             -- Only flag a network resend when the encoded bitmap or palette
             -- ACTUALLY changed
@@ -1654,8 +1699,9 @@ local function onFrameEnd()
         end
     end
 
-    -- Clear other players' sprites if they are no longer in the same room
+    -- Clear other players' sprites if they are no longer in the same room.
     local todraw = {}
+    local sig = my_area .. ":" .. my_room
     for user, pl in pairs(mf_ram.players) do
         -- Cull a player whose updates stopped.
         local stale = pl.last_frame
@@ -1671,30 +1717,39 @@ local function onFrameEnd()
             -- Screen position relative to P1.
             local world_dx = (pl.pos.x / 4) - (wx / 4)
             local world_dy = (pl.pos.y / 4) - (wy / 4)
-            todraw[#todraw + 1] = {
-                pl = pl,
-                sx = samus_sx + world_dx,
-                sy = samus_sy + world_dy,
-            }
+            local sx = math.floor(samus_sx + world_dx)
+            local sy = math.floor(samus_sy + world_dy)
+            todraw[#todraw + 1] = { pl = pl, sx = sx, sy = sy }
+            -- tostring(pl.sprite) changes identity only when a "spr" message
+            -- actually rebuilds the table
+            sig = sig .. "|" .. user .. "," .. sx .. "," .. sy .. "," .. tostring(pl.sprite)
         end
     end
 
-    if #todraw > 0 or mf_ram.drew_last_frame then
+    -- Throttle the actual redraw. During active movement the ghost's on-screen
+    -- REDRAW_GAP at 3 keeps 20hz drawing without frying the emulator (hopefully)
+    local REDRAW_GAP = 3
+    local redraw_gap_ok = (now % REDRAW_GAP) == 0
+    if sig ~= mf_ram.drawn_sig and redraw_gap_ok then
         gui.clearGraphics()
         for _, d in ipairs(todraw) do
             drawBitmap(d.pl.sprite.buf, d.pl.sprite.argb, d.sx, d.sy)
         end
+        mf_ram.drawn_sig = sig
     end
-    mf_ram.drew_last_frame = (#todraw > 0)
 end
 
-mf_ram.frame_handler_id = event.onframeend(onFrameEnd, "mf_coop_frame")
+MF_COOP_FRAME_HANDLER_ID = event.onframeend(onFrameEnd, "mf_coop_frame")
 
 if event.onexit then
-    event.onexit(function()
-        if mf_ram.frame_handler_id then
-            pcall(function() event.unregisterbyid(mf_ram.frame_handler_id) end)
-            mf_ram.frame_handler_id = nil
+    if MF_COOP_EXIT_HANDLER_ID then
+        pcall(function() event.unregisterbyid(MF_COOP_EXIT_HANDLER_ID) end)
+        MF_COOP_EXIT_HANDLER_ID = nil
+    end
+    MF_COOP_EXIT_HANDLER_ID = event.onexit(function()
+        if MF_COOP_FRAME_HANDLER_ID then
+            pcall(function() event.unregisterbyid(MF_COOP_FRAME_HANDLER_ID) end)
+            MF_COOP_FRAME_HANDLER_ID = nil
         end
         mf_ram.players = {}
     end, "mf_coop_exit")
