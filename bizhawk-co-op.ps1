@@ -17,16 +17,6 @@ $destination = $shell_app.namespace((Get-Location).Path + "\BizHawk-$version")
 $destination.Copyhere($zip_file.items())
 Remove-Item $filename
 
-#Download prereq
-$url = "https://github.com/TASEmulators/BizHawk-Prereqs/releases/download/2.4.8_1/bizhawk_prereqs_v2.4.8_1.zip"
-$filename = "bizprereq.zip"
-Invoke-WebRequest -Uri $url -OutFile $filename
-#unzip prereq
-$zip_file = $shell_app.namespace((Get-Location).Path + "\$filename")
-$destination = $shell_app.namespace((Get-Location).Path)
-$destination.Copyhere($zip_file.items())
-Remove-Item $filename
-
 #Download luasocket
 $url = "https://www.zeldaspeedruns.com/assets/luasocket-2.0.2-lua-5.1.2-Win32-vc8.zip"
 $filename = "luasocket-2.0.2-lua-5.1.2-Win32-vc8.zip"

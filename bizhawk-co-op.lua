@@ -1,3 +1,6 @@
+isWindows = (package.config:sub(1, 1) == "\\")
+pathSep = isWindows and "\\" or "/"
+
 local guiClick = {}
 
 mainform = nil
@@ -222,11 +225,13 @@ function leaveRoom()
 	end
 end
 
-
---Returns a list of files in a given directory
 function os.dir(dir)
 	local files = {}
-	local f = assert(io.popen('dir \"' .. dir .. '\" /b ', 'r'))
+	local normalized = isWindows and dir:gsub("/", "\\") or dir:gsub("\\", "/")
+	local cmd = isWindows
+		and ('dir \"' .. normalized .. '\" /b ')
+		or  ('ls -1 \"' .. normalized .. '\"')
+	local f = assert(io.popen(cmd, 'r'))
 	for file in f:lines() do
 		table.insert(files, file)
 	end
@@ -234,11 +239,78 @@ function os.dir(dir)
 	return files
 end
 
+local ramDir = "bizhawk-co-op" .. pathSep .. "ramcontroller"
+local urlBase =
+	"https://raw.githubusercontent.com/milesthenerd/bizhawk-co-op-metroid-fusion/master/bizhawk-co-op/ramcontroller/"
+
+function updateLuaFiles()
+	local files = os.dir(ramDir)
+	local updated, failed = 0, 0
+
+	for _, file in ipairs(files) do
+		if file:sub(-4) == ".lua" then
+			local url = urlBase .. file:gsub(" ", "%%20")
+			local localPath = ramDir .. pathSep .. file
+			local tempPath = localPath .. ".update_tmp"
+
+			local cmd
+			if isWindows then
+				cmd = 'curl.exe -sSL -o "' .. tempPath .. '" "' .. url ..
+					'" & echo EXIT:%errorlevel%'
+			else
+				cmd = 'curl -sSL -o "' .. tempPath .. '" "' .. url ..
+					'"; echo EXIT:$?'
+			end
+			local proc = io.popen(cmd, "r")
+			local exitCode = nil
+			if proc then
+				for line in proc:lines() do
+					local code = line:match("^EXIT:(%d+)$")
+					if code then exitCode = tonumber(code) end
+				end
+				proc:close()
+			end
+
+			local ok = false
+			if exitCode == 0 then
+				local check = io.open(tempPath, "rb")
+				if check then
+					local content = check:read("*a")
+					check:close()
+					if content and #content > 0 and not content:match("^%s*<") then
+						local out = io.open(localPath, "wb")
+						if out then
+							out:write(content)
+							out:close()
+							ok = true
+						end
+					end
+				end
+			end
+			os.remove(tempPath)
+
+			if ok then
+				printOutput("Updated " .. file)
+				updated = updated + 1
+			else
+				printOutput("Failed to fetch " .. file .. " (curl exit=" ..
+					tostring(exitCode) .. ") [URL: " .. url .. "]")
+				failed = failed + 1
+			end
+		end
+	end
+
+	printOutput("Update complete: " .. updated .. " updated, " .. failed .. " failed.")
+	if updated > 0 then
+		printOutput("Restart the script for changes to take effect.")
+	end
+end
+
 
 math.randomseed(os.time())
 
 --Create the form
-mainform = forms.newform(470, 375, "Bizhawk Co-op")
+mainform = forms.newform(470, 410, "Bizhawk Co-op")
 
 text1 = forms.textbox(mainform, "", 263, 105, nil, 16, 225, true, true, 'Vertical')
 forms.setproperty(text1, "ReadOnly", true)
@@ -290,6 +362,7 @@ btnJoin = forms.button(mainform, "Join Room",
 		function() prepareConnection(); guiClick["Join Server"] = host.join end,
 		195, 190, 85, 25)
 
+btnUpdateLua = forms.button(mainform, "Update Lua Files", updateLuaFiles, 15, 336, 140, 25)
 
 forms.label(mainform, "Players:", 288, 10, 44, 15)
 formPlayerCount = forms.label(mainform, "...", 329, 10, 40, 15)
